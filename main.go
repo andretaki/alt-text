@@ -22,11 +22,13 @@ import (
 const (
 	shopifyAPIVersion     = "2024-07"
 	defaultModel          = "gpt-5-nano-2025-08-07"
+	defaultModels         = "gpt-5-nano-2025-08-07"
 	defaultProductsLimit  = 50
 	defaultThrottleMillis = 750
 	defaultTemperature    = 0.2
 	maxOutputTokens       = 180
 	defaultOpenAIWorkers  = 4
+	defaultMinScore       = 70
 )
 
 type config struct {
@@ -34,6 +36,13 @@ type config struct {
 	ShopifyAccessToken string
 	OpenAIKey          string
 	Model              string
+	ModelsCSV          string
+	ModelCompare       bool
+	ExamplesPath       string
+	MinScore           int
+	ReportPath         string
+	HandleFilter       string
+	LimitImages        int
 	ProductsLimit      int
 	Temperature        float64
 	Throttle           time.Duration
@@ -51,9 +60,16 @@ type runner struct {
 
 func main() {
 	var (
-		dryRunFlag  = flag.Bool("dry", false, "preview changes without writing to Shopify")
-		forceFlag   = flag.Bool("force", false, "overwrite existing alt text")
-		throttleStr = flag.String("throttle", fmt.Sprintf("%dms", defaultThrottleMillis), "per-request delay (e.g., 500ms, 1s)")
+		dryRunFlag      = flag.Bool("dry", false, "preview changes without writing to Shopify")
+		forceFlag       = flag.Bool("force", false, "overwrite existing alt text")
+		throttleStr     = flag.String("throttle", fmt.Sprintf("%dms", defaultThrottleMillis), "per-request delay (e.g., 500ms, 1s)")
+		modelsFlag      = flag.String("models", "", "comma-separated model fallbacks (first wins)")
+		modelCompareFlg = flag.Bool("model-compare", false, "generate alt text with all models and print comparison")
+		examplesPath    = flag.String("examples", "", "path to JSON/CSV with few-shot examples to inject")
+		minScore        = flag.Int("min-score", defaultMinScore, "minimum quality score to write to Shopify (0-100)")
+		reportPath      = flag.String("report", "", "write JSONL report of generations (inputs, outputs, scores)")
+		handleFilter    = flag.String("handles", "", "comma-separated product handle substrings to filter")
+		limitImages     = flag.Int("limit-images", 0, "max images to process (for testing)")
 	)
 	flag.Parse()
 
@@ -62,9 +78,30 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
+	// Apply flag overrides
+	if *modelsFlag != "" {
+		cfg.ModelsCSV = *modelsFlag
+	}
+	cfg.ModelCompare = *modelCompareFlg
+	cfg.ExamplesPath = *examplesPath
+	cfg.MinScore = *minScore
+	cfg.ReportPath = *reportPath
+	cfg.HandleFilter = *handleFilter
+	cfg.LimitImages = *limitImages
+
 	httpClient := &http.Client{Timeout: 60 * time.Second}
 	shopify := newShopifyClient(cfg.ShopifyStore, cfg.ShopifyAccessToken, httpClient)
-	openai := newOpenAIClient(cfg.OpenAIKey, cfg.Model, cfg.Temperature, httpClient)
+
+	// Load few-shot examples if provided
+	fewShots, err := loadFewShot(cfg.ExamplesPath)
+	if err != nil {
+		log.Fatalf("examples error: %v", err)
+	}
+	if len(fewShots) > 0 {
+		log.Printf("Loaded %d few-shot examples from %s", len(fewShots), cfg.ExamplesPath)
+	}
+
+	openai := newOpenAIClient(cfg.OpenAIKey, cfg.Model, splitCSV(cfg.ModelsCSV), cfg.ModelCompare, cfg.Temperature, fewShots, httpClient)
 
 	r := &runner{
 		cfg:        cfg,
@@ -91,9 +128,11 @@ func loadConfig(throttleOverride string) (config, error) {
 		ShopifyAccessToken: firstNonEmpty(env("SHOPIFY_ADMIN_TOKEN"), env("SHOPIFY_ACCESS_TOKEN")),
 		OpenAIKey:          env("OPENAI_API_KEY"),
 		Model:              firstNonEmpty(env("MODEL"), defaultModel),
+		ModelsCSV:          firstNonEmpty(env("MODELS"), defaultModels),
 		ProductsLimit:      defaultProductsLimit,
 		Temperature:        defaultTemperature,
 		OpenAIWorkers:      defaultOpenAIWorkers,
+		MinScore:           defaultMinScore,
 	}
 
 	if cfg.ShopifyStore == "" {
@@ -173,6 +212,22 @@ func (r *runner) run(ctx context.Context) error {
 
 		for _, product := range page.Products {
 			totalProducts++
+
+			// Filter by handle if specified
+			if r.cfg.HandleFilter != "" {
+				filterHandles := splitCSV(r.cfg.HandleFilter)
+				matchesFilter := false
+				for _, fh := range filterHandles {
+					if strings.Contains(strings.ToLower(product.Handle), strings.ToLower(fh)) {
+						matchesFilter = true
+						break
+					}
+				}
+				if !matchesFilter {
+					continue
+				}
+			}
+
 			for _, img := range product.Images {
 				totalImages++
 				if !r.force && img.AltText != "" {
@@ -184,6 +239,16 @@ func (r *runner) run(ctx context.Context) error {
 					product: product,
 					image:   img,
 				})
+
+				// Apply image limit if specified
+				if r.cfg.LimitImages > 0 && len(jobs) >= r.cfg.LimitImages {
+					break
+				}
+			}
+
+			// Break outer loop if we've hit the limit
+			if r.cfg.LimitImages > 0 && len(jobs) >= r.cfg.LimitImages {
+				break
 			}
 		}
 
@@ -212,6 +277,100 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+type FewShot struct {
+	Title    string `json:"title"`
+	Brand    string `json:"brand"`
+	Type     string `json:"type"`
+	Alt      string `json:"alt"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+type reportRow struct {
+	Time         string   `json:"time"`
+	ProductID    string   `json:"product_id"`
+	Title        string   `json:"title"`
+	Vendor       string   `json:"vendor"`
+	Type         string   `json:"type"`
+	Handle       string   `json:"handle"`
+	ImageURL     string   `json:"image_url"`
+	Output       string   `json:"alt"`
+	Score        int      `json:"score"`
+	Reasons      []string `json:"reasons"`
+	WroteShopify bool     `json:"wrote_shopify"`
+	ModelTried   []string `json:"models"`
+}
+
+var reportMu sync.Mutex
+
+func appendReport(path string, row reportRow) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	reportMu.Lock()
+	defer reportMu.Unlock()
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("report open err: %v", err)
+		return
+	}
+	defer f.Close()
+
+	enc, _ := json.Marshal(row)
+	f.Write(append(enc, '\n'))
+}
+
+func loadFewShot(path string) ([]FewShot, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var rows []FewShot
+	if strings.HasSuffix(strings.ToLower(path), ".csv") {
+		// Simple CSV parser (title,brand,type,alt)
+		lines := strings.Split(string(b), "\n")
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			if ln == "" || strings.HasPrefix(ln, "#") {
+				continue
+			}
+			cols := strings.Split(ln, ",")
+			if len(cols) < 4 {
+				continue
+			}
+			rows = append(rows, FewShot{
+				Title: strings.TrimSpace(cols[0]),
+				Brand: strings.TrimSpace(cols[1]),
+				Type:  strings.TrimSpace(cols[2]),
+				Alt:   strings.TrimSpace(cols[3]),
+			})
+		}
+	} else {
+		if err := json.Unmarshal(b, &rows); err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
 }
 
 func sanitizeStoreDomain(store string) string {
@@ -248,6 +407,7 @@ type product struct {
 	Vendor      string
 	ProductType string
 	Handle      string
+	Tags        []string
 	Images      []mediaImage
 }
 
@@ -259,9 +419,8 @@ type mediaImage struct {
 }
 
 func (m mediaImage) FileID() string {
-	if m.ImageID != "" {
-		return m.ImageID
-	}
+	// For fileUpdate mutation, use the MediaImage.id directly
+	// According to Shopify docs, MediaImage implements the File interface
 	return m.ID
 }
 
@@ -297,6 +456,7 @@ func (c *shopifyClient) FetchProducts(ctx context.Context, first int, after *str
         vendor
         productType
         handle
+        tags
         media(first: 100) {
           edges {
             node {
@@ -358,11 +518,12 @@ func (c *shopifyClient) FetchProducts(ctx context.Context, first int, after *str
 				Edges []struct {
 					Cursor string `json:"cursor"`
 					Node   struct {
-						ID          string `json:"id"`
-						Title       string `json:"title"`
-						Vendor      string `json:"vendor"`
-						ProductType string `json:"productType"`
-						Handle      string `json:"handle"`
+						ID          string   `json:"id"`
+						Title       string   `json:"title"`
+						Vendor      string   `json:"vendor"`
+						ProductType string   `json:"productType"`
+						Handle      string   `json:"handle"`
+						Tags        []string `json:"tags"`
 						Media       struct {
 							Edges []struct {
 								Node struct {
@@ -411,6 +572,7 @@ func (c *shopifyClient) FetchProducts(ctx context.Context, first int, after *str
 			Vendor:      edge.Node.Vendor,
 			ProductType: edge.Node.ProductType,
 			Handle:      edge.Node.Handle,
+			Tags:        edge.Node.Tags,
 		}
 
 		for _, mediaEdge := range edge.Node.Media.Edges {
@@ -558,6 +720,7 @@ func (r *runner) processAltJobs(ctx context.Context, jobs []imageJob) (int, int)
 					Vendor:       job.product.Vendor,
 					ProductType:  job.product.ProductType,
 					Handle:       job.product.Handle,
+					Tags:         job.product.Tags,
 					ImageURL:     job.image.URL,
 				})
 				select {
@@ -597,29 +760,76 @@ func (r *runner) processAltJobs(ctx context.Context, jobs []imageJob) (int, int)
 				return generated, updated
 			}
 
+			// Initialize report row
+			reportData := reportRow{
+				Time:      time.Now().Format(time.RFC3339),
+				ProductID: res.job.product.ID,
+				Title:     res.job.product.Title,
+				Vendor:    res.job.product.Vendor,
+				Type:      res.job.product.ProductType,
+				Handle:    res.job.product.Handle,
+				ImageURL:  res.job.image.URL,
+			}
+
 			if res.err != nil {
 				log.Printf("OpenAI error for product %s (%s): %v", res.job.product.ID, res.job.image.ID, res.err)
+				reportData.Output = ""
+				reportData.Reasons = []string{fmt.Sprintf("openai_error: %v", res.err)}
+				appendReport(r.cfg.ReportPath, reportData)
 				continue
 			}
 
 			alt := strings.TrimSpace(res.alt)
 			if alt == "" {
 				log.Printf("OpenAI returned empty alt for product %s (%s)", res.job.product.ID, res.job.image.ID)
+				reportData.Output = ""
+				reportData.Reasons = []string{"empty_output"}
+				appendReport(r.cfg.ReportPath, reportData)
+				continue
+			}
+
+			// Evaluate quality
+			_, reasons, score := evaluateAltV2(alt, promptInput{
+				ProductTitle: res.job.product.Title,
+				Vendor:       res.job.product.Vendor,
+				ProductType:  res.job.product.ProductType,
+				Handle:       res.job.product.Handle,
+				Tags:         res.job.product.Tags,
+				ImageURL:     res.job.image.URL,
+			})
+
+			reportData.Output = alt
+			reportData.Score = score
+			reportData.Reasons = reasons
+
+			// Gate by min-score
+			if score < r.cfg.MinScore {
+				log.Printf("SKIP (score %d < %d) %s reasons=%v text=%q",
+					score, r.cfg.MinScore, res.job.image.URL, reasons, alt)
+				reportData.WroteShopify = false
+				appendReport(r.cfg.ReportPath, reportData)
 				continue
 			}
 
 			generated++
-			log.Printf("Generated alt text for %s: %q", res.job.image.URL, alt)
+			log.Printf("Generated alt text for %s (score=%d): %q", res.job.image.URL, score, alt)
 
 			if r.dryRun {
+				reportData.WroteShopify = false
+				appendReport(r.cfg.ReportPath, reportData)
 				continue
 			}
 
 			if err := r.shopify.UpdateAltText(ctx, fileUpdateInput{ID: res.job.image.FileID(), Alt: alt}); err != nil {
 				log.Printf("Shopify update error for image %s: %v", res.job.image.ID, err)
+				reportData.WroteShopify = false
+				reportData.Reasons = append(reportData.Reasons, fmt.Sprintf("shopify_error: %v", err))
+				appendReport(r.cfg.ReportPath, reportData)
 				continue
 			}
 			updated++
+			reportData.WroteShopify = true
+			appendReport(r.cfg.ReportPath, reportData)
 
 			if r.cfg.Throttle > 0 {
 				if err := sleepContext(ctx, r.cfg.Throttle); err != nil {
@@ -649,18 +859,24 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 // ==== OpenAI client + prompt (E-E-A-T + SEO tuned) ====
 
 type openAIClient struct {
-	apiKey      string
-	model       string
-	temperature float64
-	httpClient  *http.Client
+	apiKey       string
+	model        string
+	models       []string
+	modelCompare bool
+	temperature  float64
+	fewShots     []FewShot
+	httpClient   *http.Client
 }
 
-func newOpenAIClient(apiKey, model string, temperature float64, httpClient *http.Client) *openAIClient {
+func newOpenAIClient(apiKey, model string, models []string, modelCompare bool, temperature float64, fewShots []FewShot, httpClient *http.Client) *openAIClient {
 	return &openAIClient{
-		apiKey:      apiKey,
-		model:       model,
-		temperature: temperature,
-		httpClient:  httpClient,
+		apiKey:       apiKey,
+		model:        model,
+		models:       models,
+		modelCompare: modelCompare,
+		temperature:  temperature,
+		fewShots:     fewShots,
+		httpClient:   httpClient,
 	}
 }
 
@@ -669,6 +885,7 @@ type promptInput struct {
 	Vendor       string
 	ProductType  string
 	Handle       string
+	Tags         []string
 	ImageURL     string
 }
 
@@ -677,83 +894,146 @@ func (c *openAIClient) GenerateAltText(ctx context.Context, input promptInput) (
 		return "", errors.New("missing image URL")
 	}
 
-	systemPrompt := strings.TrimSpace(`You are an e-commerce accessibility + SEO specialist.
-Write ALT text that:
-- Maximizes clarity and trust (E-E-A-T) by naming the product precisely and describing ONE concrete visible feature (color/shape/container/label text, etc.).
-- Uses natural, factual language; NO hype words (premium, best, cheap, amazing), NO health/biocidal claims.
-- Fits accessibility norms: one concise sentence, no emojis, no ALL-CAPS, no extra punctuation.
-- 12–18 words total. Return ONLY the alt text line.`)
-
-	var userLines []string
-	userLines = append(userLines, fmt.Sprintf("Product title: %s", input.ProductTitle))
-	if input.Vendor != "" {
-		userLines = append(userLines, fmt.Sprintf("Brand or vendor: %s", input.Vendor))
+	models := c.models
+	if len(models) == 0 {
+		models = []string{c.model}
 	}
+
+	if c.modelCompare {
+		// Run all models and print comparison; return best by score
+		var best string
+		bestScore := -1
+		for _, m := range models {
+			out, _, err := c.callWithModel(ctx, input, m, c.temperature)
+			if err != nil {
+				log.Printf("[compare] %s error: %v", m, err)
+				continue
+			}
+			out = normalizeAlt(out)
+			ok, reasons, score := evaluateAltV2(out, input)
+			log.Printf("[compare] %s => %q ok=%t score=%d reasons=%v", m, out, ok, score, reasons)
+			if score > bestScore {
+				best, bestScore = out, score
+			}
+		}
+		if best == "" {
+			return "", errors.New("all models failed in --model-compare")
+		}
+		return best, nil
+	}
+
+	// Fallback chain
+	for i, m := range models {
+		out, raw, err := c.callWithModel(ctx, input, m, c.temperature)
+		if err != nil {
+			log.Printf("model %s failed (%d/%d): %v", m, i+1, len(models), err)
+			continue
+		}
+		out = normalizeAlt(out)
+		ok, reasons, score := evaluateAltV2(out, input)
+		if ok {
+			return out, nil
+		}
+
+		// One deterministic low-temp retry before falling back
+		out2, _, err2 := c.callWithModel(ctx, input, m, 0.0)
+		if err2 == nil {
+			out2 = normalizeAlt(out2)
+			ok2, reasons2, _ := evaluateAltV2(out2, input)
+			if ok2 {
+				return out2, nil
+			}
+			log.Printf("quality fail on %s (score=%d): %q reasons=%v; retry reasons=%v (raw=%s)",
+				m, score, out, reasons, reasons2, truncate(raw, 200))
+		} else {
+			log.Printf("retry error on %s: %v (raw=%s)", m, err2, truncate(raw, 200))
+		}
+	}
+	return "", errors.New("all models produced low-quality outputs")
+}
+
+func (c *openAIClient) callWithModel(ctx context.Context, input promptInput, model string, temp float64) (string, string, error) {
+	payload := c.buildOpenAIPayload(model, temp, input)
+	return c.callResponses(ctx, payload)
+}
+
+func (c *openAIClient) buildOpenAIPayload(model string, temp float64, input promptInput) openAIRequest {
+	sys := `You are an accessibility + SEO specialist for e-commerce images.
+When describing, be *visually grounded* and concise:
+- State exact product name and brand once, naturally.
+- Mention ONE clearly visible trait from the image: container (bottle, drum, pail, jug, tote), apparent size, color, label/markings, cap style.
+- Avoid hype, purity/biocidal claims, emojis, ALL-CAPS. One sentence, 12–18 words, no trailing period.
+If uncertain about a trait, omit it; never invent details.`
+
+	// Domain context
+	domain := ""
 	if input.ProductType != "" {
-		userLines = append(userLines, fmt.Sprintf("Product type: %s", input.ProductType))
+		domain = "Product category: " + input.ProductType
 	}
-	if input.Handle != "" {
-		userLines = append(userLines, fmt.Sprintf("Product handle: %s", input.Handle))
+
+	// Add relevant tags
+	tagInfo := ""
+	if len(input.Tags) > 0 {
+		relevantTags := extractRelevantTags(input.Tags)
+		if len(relevantTags) > 0 {
+			tagInfo = "Product tags: " + strings.Join(relevantTags, ", ")
+		}
 	}
-	userLines = append(userLines,
+
+	usr := strings.Join([]string{
+		"Product title: " + input.ProductTitle,
+		"Brand/vendor: " + input.Vendor,
+		domain,
+		"Handle: " + input.Handle,
+		tagInfo,
 		"Instructions:",
-		"- Include the exact product name and brand (if provided) naturally (no stuffing).",
-		"- Mention ONE visible attribute that is clearly in the image (e.g., container size, color, label).",
-		"- 12–18 words; sentence case; avoid trailing period.",
 		"- Return only the alt text line.",
-	)
+		"- 12–18 words; sentence case.",
+		"- For chemical/industrial products, prioritize container type and size over subjective descriptions.",
+	}, "\n")
 
-	payload := openAIRequest{
-		Model:       c.model,
-		Temperature: c.temperature,
-		MaxTokens:   maxOutputTokens,
-		Messages: []openAIMessage{
-			{
-				Role: "system",
-				Content: []openAIContent{
-					{Type: "input_text", Text: systemPrompt},
-				},
-			},
-			{
-				Role: "user",
-				Content: []openAIContent{
-					{Type: "input_text", Text: strings.Join(userLines, "\n")},
-					{Type: "input_image", ImageURL: input.ImageURL},
-				},
-			},
+	messages := []openAIMessage{
+		{Role: "system", Content: []openAIContent{{Type: "text", Text: sys}}},
+	}
+
+	// Inject few-shot examples if available
+	if len(c.fewShots) > 0 {
+		var sb strings.Builder
+		sb.WriteString("Here are style examples:\n")
+		limit := 3
+		if len(c.fewShots) < limit {
+			limit = len(c.fewShots)
+		}
+		for i := 0; i < limit; i++ {
+			f := c.fewShots[i]
+			fmt.Fprintf(&sb, "- %s / %s → %s\n", f.Title, f.Brand, f.Alt)
+		}
+		messages = append(messages, openAIMessage{
+			Role:    "system",
+			Content: []openAIContent{{Type: "text", Text: sb.String()}},
+		})
+	}
+
+	// Main user request with image
+	messages = append(messages, openAIMessage{
+		Role: "user",
+		Content: []openAIContent{
+			{Type: "text", Text: usr},
+			{Type: "image_url", ImageURL: &openAIImageURL{URL: input.ImageURL}},
 		},
-	}
+	})
 
-	candidate, raw, err := c.callResponses(ctx, payload)
-	if err != nil {
-		return "", err
+	req := openAIRequest{
+		Model:     model,
+		MaxTokens: maxOutputTokens,
+		Input:     messages,
 	}
-	candidate = normalizeAlt(candidate)
-	ok, _ := evaluateAlt(candidate, input)
-	if !ok {
-		payload.Temperature = 0.0
-		payload.Messages[1].Content[0].Text = strings.Join([]string{
-			strings.Join(userLines, "\n"),
-			"Strict rules:",
-			"- Must be 12–18 words.",
-			"- Must include brand/vendor (if provided) and exact product name once.",
-			"- Include one clearly visible trait (e.g., container type/size, color, label text).",
-			"- No hype words, no biocidal claims, no ALL-CAPS, no trailing period.",
-			"- Return only the alt text line.",
-		}, "\n")
-
-		candidate2, _, err2 := c.callResponses(ctx, payload)
-		if err2 != nil {
-			return "", fmt.Errorf("openai retry failed: %w", err2)
-		}
-		candidate2 = normalizeAlt(candidate2)
-		ok2, reasons := evaluateAlt(candidate2, input)
-		if !ok2 {
-			return "", fmt.Errorf("openai returned low-quality alt text after retry: %q (raw=%s) reasons: %v", candidate2, truncate(raw, 220), reasons)
-		}
-		return candidate2, nil
-	}
-	return candidate, nil
+	// Note: gpt-5-nano doesn't support temperature parameter
+	// Only include if non-default and model supports it
+	// if temp != defaultTemperature {
+	// 	req.Temperature = temp
+	// }
+	return req
 }
 
 func normalizeAlt(s string) string {
@@ -779,7 +1059,7 @@ type openAIRequest struct {
 	Model       string          `json:"model"`
 	Temperature float64         `json:"temperature,omitempty"`
 	MaxTokens   int             `json:"max_output_tokens,omitempty"`
-	Messages    []openAIMessage `json:"messages"`
+	Input       []openAIMessage `json:"input"`
 }
 
 type openAIMessage struct {
@@ -787,10 +1067,14 @@ type openAIMessage struct {
 	Content []openAIContent `json:"content"`
 }
 
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
 type openAIContent struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
+	Type     string           `json:"type"`                    // "text" | "image_url"
+	Text     string           `json:"text,omitempty"`          // when Type == "text"
+	ImageURL *openAIImageURL  `json:"image_url,omitempty"`     // when Type == "image_url"
 }
 
 type openAIResponse struct {
@@ -811,11 +1095,18 @@ type openAIErrorResponse struct {
 }
 
 func (c *openAIClient) callResponses(ctx context.Context, reqBody openAIRequest) (string, string, error) {
-	bodyBytes, err := json.Marshal(reqBody)
+	// Convert to Chat Completions API format
+	chatReq := map[string]interface{}{
+		"model":      reqBody.Model,
+		"messages":   reqBody.Input,
+		"max_tokens": reqBody.MaxTokens,
+	}
+
+	bodyBytes, err := json.Marshal(chatReq)
 	if err != nil {
 		return "", "", fmt.Errorf("marshal openai request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/responses", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", "", fmt.Errorf("new openai request: %w", err)
 	}
@@ -837,17 +1128,20 @@ func (c *openAIClient) callResponses(ctx context.Context, reqBody openAIRequest)
 		return "", string(respBytes), fmt.Errorf("openai status %d", resp.StatusCode)
 	}
 
-	var decoded openAIResponse
+	// Parse Chat Completions response format
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
 	if err := json.Unmarshal(respBytes, &decoded); err != nil {
 		return "", string(respBytes), fmt.Errorf("decode openai response: %w", err)
 	}
 
-	for _, out := range decoded.Output {
-		for _, c := range out.Content {
-			if strings.TrimSpace(c.Text) != "" {
-				return c.Text, string(respBytes), nil
-			}
-		}
+	if len(decoded.Choices) > 0 && decoded.Choices[0].Message.Content != "" {
+		return decoded.Choices[0].Message.Content, string(respBytes), nil
 	}
 	return "", string(respBytes), nil
 }
@@ -857,50 +1151,111 @@ func (c *openAIClient) callResponses(ctx context.Context, reqBody openAIRequest)
 var hypeWords = []string{"premium", "best", "top", "amazing", "cheap", "world-class", "leading"}
 var biocideWords = []string{"disinfect", "disinfection", "antibacterial", "antimicrobial", "sanitiz", "steriliz"}
 
+// Visual detail indicators - words that show the AI actually described what it saw
+var visualDetailWords = []string{
+	// Container types
+	"drum", "bottle", "jar", "jug", "pail", "tote", "bag", "pouch", "can", "tube", "container", "vial",
+	// Colors
+	"white", "black", "blue", "red", "green", "yellow", "amber", "clear", "brown", "gray",
+	// Materials
+	"plastic", "glass", "metal", "steel", "hdpe", "aluminum",
+	// Features
+	"label", "cap", "lid", "pump", "dispenser", "valve", "handle", "spout",
+	// Sizes (with numbers)
+	"gallon", "liter", "ml", "oz", "quart", "pint", "kg", "lb",
+}
+
+// Generic phrases that show lack of specificity
+var genericPhrases = []string{
+	"product image", "product photo", "item shown", "as pictured",
+	"high quality", "great value", "excellent product",
+}
+
 var nonAlpha = regexp.MustCompile(`[^A-Za-z0-9]+`)
 
+// evaluateAlt is the legacy boolean evaluator - kept for compatibility
 func evaluateAlt(alt string, in promptInput) (bool, []string) {
-	var issues []string
-	wordCount := len(strings.Fields(alt))
-	if wordCount < 12 || wordCount > 18 {
-		issues = append(issues, fmt.Sprintf("word_count=%d (want 12–18)", wordCount))
+	ok, reasons, _ := evaluateAltV2(alt, in)
+	return ok, reasons
+}
+
+// evaluateAltV2 returns (ok, reasons, score 0-100)
+func evaluateAltV2(alt string, in promptInput) (bool, []string, int) {
+	score := 100
+	var reasons []string
+
+	wc := len(strings.Fields(alt))
+	if wc < 12 || wc > 18 {
+		score -= 25
+		reasons = append(reasons, fmt.Sprintf("bad length (%d words)", wc))
 	}
 
-	titleSig := significantTokens(in.ProductTitle, 5)
-	keywordMatches := 0
-	for _, token := range titleSig {
-		if containsWord(alt, token) {
-			keywordMatches++
+	// Title keyword coverage
+	want := significantTokens(in.ProductTitle, 5)
+	got := 0
+	for _, t := range want {
+		if containsWord(alt, t) {
+			got++
 		}
 	}
-	requiredMatches := min(2, len(titleSig))
-	if keywordMatches < requiredMatches {
-		issues = append(issues, "not enough product keywords from title")
+	if got < min(2, len(want)) {
+		score -= 15
+		reasons = append(reasons, "weak title coverage")
 	}
 
+	// Brand coverage
 	if in.Vendor != "" && !containsWord(alt, in.Vendor) {
-		issues = append(issues, "missing brand/vendor")
+		score -= 10
+		reasons = append(reasons, "missing brand")
 	}
 
+	// Penalize generic phrases
+	if containsAnyFold(alt, genericPhrases) {
+		score -= 20
+		reasons = append(reasons, "generic phrasing")
+	}
+
+	// Visual detail presence (reward image-specific descriptions)
+	if !containsAnyFold(alt, visualDetailWords) {
+		score -= 10
+		reasons = append(reasons, "no visual detail")
+	}
+
+	// Hype and biocidal claims
 	if containsAnyFold(alt, hypeWords) {
-		issues = append(issues, "contains hype words")
+		score -= 20
+		reasons = append(reasons, "hype")
 	}
 	if containsAnyFold(alt, biocideWords) {
-		issues = append(issues, "contains disinfection/biocidal wording")
+		score -= 30
+		reasons = append(reasons, "biocidal claim")
 	}
 
-	for _, tok := range strings.Fields(alt) {
+	// Repetition
+	if repetitionScore(alt) > 2 {
+		score -= 10
+		reasons = append(reasons, "repetition")
+	}
+
+	// ALL-CAPS words
+	if hasAllCapsWord(alt) {
+		score -= 5
+		reasons = append(reasons, "ALL-CAPS")
+	}
+
+	if score < 70 {
+		return false, reasons, score
+	}
+	return true, reasons, score
+}
+
+func hasAllCapsWord(s string) bool {
+	for _, tok := range strings.Fields(s) {
 		if len(tok) >= 4 && isAllCaps(tok) {
-			issues = append(issues, "contains ALL-CAPS token")
-			break
+			return true
 		}
 	}
-
-	if repetitionScore(alt) > 2 {
-		issues = append(issues, "excessive repetition")
-	}
-
-	return len(issues) == 0, issues
+	return false
 }
 
 func significantTokens(s string, max int) []string {
@@ -969,4 +1324,44 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// extractRelevantTags filters tags to keep only those that provide useful context
+// (sizes, certifications, forms, hazard classes) and excludes generic marketing tags
+func extractRelevantTags(tags []string) []string {
+	var relevant []string
+	genericTags := map[string]bool{
+		"new": true, "sale": true, "featured": true, "popular": true,
+		"bestseller": true, "trending": true, "hot": true,
+	}
+
+	// Patterns that indicate relevant tags for industrial/lab chemicals
+	relevantPatterns := []string{
+		"gallon", "liter", "drum", "pail", "quart", "pint", "ml", "oz",
+		"acs", "usp", "grade", "certified", "pure", "technical",
+		"liquid", "solid", "powder", "pellets", "flake",
+		"hazard", "corrosive", "flammable", "oxidizer",
+	}
+
+	for _, tag := range tags {
+		tagLower := strings.ToLower(strings.TrimSpace(tag))
+		if tagLower == "" || genericTags[tagLower] {
+			continue
+		}
+
+		// Check if tag contains any relevant pattern
+		for _, pattern := range relevantPatterns {
+			if strings.Contains(tagLower, pattern) {
+				relevant = append(relevant, tag)
+				break
+			}
+		}
+
+		// Limit to first 3 relevant tags to avoid clutter
+		if len(relevant) >= 3 {
+			break
+		}
+	}
+
+	return relevant
 }
